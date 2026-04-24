@@ -179,10 +179,11 @@ def _parse_vcd_sample(s: str):
     }
 
 
-def _parse_titer_sample(s: str, canonical_by_norm: dict):
+def _parse_titer_sample(s: str, canonical_by_norm: dict, vessel_to_treatment: dict = None):
     """
     Parse titer sample identifiers. canonical_by_norm maps loose-normalized VCD
     treatment → canonical name (may include _1/_2 sub-conditions).
+    vessel_to_treatment maps zero-padded vessel number → canonical treatment (from VCD).
 
     Returns (canonical_treatment, day, rep_key or None) or None.
     rep_key=None means positional rep; otherwise the explicit vessel/rep number.
@@ -196,6 +197,24 @@ def _parse_titer_sample(s: str, canonical_by_norm: dict):
 
     def find_canon(name):
         return canonical_by_norm.get(_loose_normalize(name))
+
+    # Priority 0: trailing 2-digit vessel number (Cedex Bio export style, common for
+    # Hybridoma/VERO). This is the most reliable match since VCD and Titer sheets use
+    # different naming conventions (e.g. VCD 'MALT Glc 5%' vs Titer '5% Malt (Glc)'),
+    # but the vessel number (01-50) is always consistent.
+    if vessel_to_treatment:
+        # Require 2+ digits (or leading zero) so CHO-style "IMDM 2" (sub-condition _2)
+        # doesn't get mis-matched as vessel 02. Hybridoma vessels are always
+        # zero-padded ("01"-"50") so this distinction is reliable.
+        m_vessel = re.search(r"(?:^|\s)#?(0\d|\d{2,3})\s*$", tail)
+        if m_vessel:
+            v = m_vessel.group(1)
+            v_padded = v.zfill(2)
+            t = (vessel_to_treatment.get(v)
+                 or vessel_to_treatment.get(v_padded)
+                 or vessel_to_treatment.get(v.lstrip("0") or "0"))
+            if t:
+                return t, day, v_padded
 
     # Priority 1: exact tail (e.g., "SOY-BIO_1" → VCD's "SOY-BIO 1")
     c = find_canon(tail)
@@ -349,7 +368,7 @@ def _read_raw_vcd(xl: pd.ExcelFile):
     return vcd, sorted(all_days), treatment_order
 
 
-def _read_raw_titer(xl: pd.ExcelFile, canonical_by_norm: dict):
+def _read_raw_titer(xl: pd.ExcelFile, canonical_by_norm: dict, vessel_to_treatment: dict = None):
     """
     Find 'Raw Titer' sheet (Cedex Bio export). Return dict:
       titer[treatment][rep_key][day] = value (mg/L)
@@ -393,7 +412,7 @@ def _read_raw_titer(xl: pd.ExcelFile, canonical_by_norm: dict):
         sample = df.iloc[r, sample_col]
         if pd.isna(sample):
             continue
-        parsed = _parse_titer_sample(sample, canonical_by_norm)
+        parsed = _parse_titer_sample(sample, canonical_by_norm, vessel_to_treatment)
         raw = df.iloc[r, result_col] if result_col < df.shape[1] else None
         test = str(df.iloc[r, test_col]).strip() if test_col is not None and pd.notna(df.iloc[r, test_col]) else ""
 
@@ -591,7 +610,15 @@ def process_file(file_bytes: bytes, basal_media: str = "", feed_media: str = "")
             continue
     cell_line, culture_mode = _detect_from_samples(samples, xl.sheet_names)
 
-    titer = _read_raw_titer(xl, canonical_by_norm)
+    # Build vessel → canonical treatment map (for Hybridoma-style titer samples that
+    # use different naming conventions but include trailing vessel numbers)
+    vessel_to_treatment: dict = {}
+    for t, vdict in vcd.items():
+        for vessel in vdict.keys():
+            vessel_to_treatment[vessel] = t
+            vessel_to_treatment[vessel.lstrip("0") or "0"] = t
+
+    titer = _read_raw_titer(xl, canonical_by_norm, vessel_to_treatment)
 
     v2r = _build_vessel_to_rep(vcd)
 
