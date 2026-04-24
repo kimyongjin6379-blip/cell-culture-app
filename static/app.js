@@ -55,6 +55,8 @@ uploadForm.addEventListener("submit", async e => {
 
   const fd = new FormData();
   fd.append("file", file);
+  fd.append("basal_media", document.getElementById("basal-media").value || "");
+  fd.append("feed_media",  document.getElementById("feed-media").value  || "");
 
   try {
     const res = await fetch("/api/process", { method: "POST", body: fd });

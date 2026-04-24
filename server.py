@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -17,12 +17,16 @@ async def root():
 
 
 @app.post("/api/process")
-async def process(file: UploadFile = File(...)):
+async def process(
+    file: UploadFile = File(...),
+    basal_media: str = Form(""),
+    feed_media: str = Form(""),
+):
     if not file.filename.endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="Excel 파일(.xlsx)만 업로드 가능합니다.")
     try:
         contents = await file.read()
-        result = process_file(contents)
+        result = process_file(contents, basal_media=basal_media, feed_media=feed_media)
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"처리 중 오류 발생: {str(e)}")

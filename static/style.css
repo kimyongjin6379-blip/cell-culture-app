@@ -65,6 +65,30 @@ body {
   margin-bottom: 10px;
 }
 
+/* ── Text inputs ─────────────────────────────────────────────────────── */
+.field-label {
+  display: block;
+  font-size: 12px;
+  color: #1F4E79;
+  font-weight: 600;
+  margin: 8px 0 4px;
+}
+.text-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #A8C5DA;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  background: #FFFFFF;
+  transition: border-color 0.2s;
+  box-sizing: border-box;
+}
+.text-input:focus {
+  outline: none;
+  border-color: #1F4E79;
+}
+
 /* ── Drop zone ───────────────────────────────────────────────────────── */
 .drop-zone {
   border: 2px dashed #A8C5DA;

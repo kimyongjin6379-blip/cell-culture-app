@@ -25,16 +25,27 @@
               <path d="M12 16V4m0 0L8 8m4-4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
               <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke-linecap="round"/>
             </svg>
-            <p>정리 시트가 포함된 Excel 파일을<br>드래그하거나 클릭하여 업로드</p>
+            <p>Raw VCD + Raw Titer 시트가 포함된<br>Excel 파일을 드래그하거나 클릭하여 업로드</p>
             <span class="file-hint">.xlsx 형식</span>
             <input type="file" id="file-input" accept=".xlsx,.xls" hidden />
           </div>
           <div id="file-name" class="file-name hidden"></div>
         </section>
 
+        <!-- Media info -->
+        <section class="form-section">
+          <h2>2. 배지 정보 (선택)</h2>
+          <label class="field-label">Basal Media</label>
+          <input type="text" id="basal-media" class="text-input"
+                 placeholder="예) CD CHO + 6mM L-Glutamine" />
+          <label class="field-label">Feed Media (쉼표 구분, 비우면 자동)</label>
+          <input type="text" id="feed-media" class="text-input"
+                 placeholder="예) SOY-BIO 1, SOY-BIO 2, IMDM" />
+        </section>
+
         <!-- Display options -->
         <section class="form-section">
-          <h2>2. 표시 옵션</h2>
+          <h2>3. 표시 옵션</h2>
           <label class="toggle-label">
             <span>평균 ± SD 표시</span>
             <label class="switch">
