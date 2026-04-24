@@ -92,8 +92,13 @@ def _loose_normalize(s: str) -> str:
     s = re.sub(r"\([^)]*\)", " ", s)
     # Strip bare "PILOT" token too (appears unbracketed in some sheets)
     s = re.sub(r"\bPILOT\b", " ", s)
+    # Known typo corrections (researcher-confirmed)
+    s = re.sub(r"\bMATL\b", "MALT", s)
+    s = re.sub(r"AFRICAFRICA", "AFRICA", s)
     s = re.sub(r"0+(\d)", r"\1", s)        # strip leading zeros
-    s = re.sub(r"[\s_\-]+", " ", s).strip()
+    # Remove ALL whitespace/underscore/hyphen so "MEALWORM" == "MEAL WORM",
+    # "WHEAT-BIO 1" == "WHEAT BIO 1" etc.
+    s = re.sub(r"[\s_\-]+", "", s).strip()
     return s
 
 
