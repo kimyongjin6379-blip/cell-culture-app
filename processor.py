@@ -27,9 +27,9 @@ CULTURE_DURATIONS = {
 
 SECTION_META = {
     "vcd":        {"label": "Viable Cell Density (VCD)", "unit": "×10⁵ cells/mL",    "chart_type": "line"},
-    "ivcd":       {"label": "IVCD",                      "unit": "×10⁵ cell·day/mL", "chart_type": "line"},
+    "ivcd":       {"label": "IVCD",                      "unit": "×10⁵ cell·day/mL", "chart_type": "bar"},
     "viability":  {"label": "Viability",                 "unit": "%",                "chart_type": "line"},
-    "titer":      {"label": "Titer",                     "unit": "mg/L",             "chart_type": "line"},
+    "titer":      {"label": "Titer",                     "unit": "mg/L",             "chart_type": "bar"},
     "qp":         {"label": "Specific Productivity (Qp)","unit": "pg/cell/day",      "chart_type": "bar"},
     "mu":         {"label": "Specific Growth Rate (μ)",  "unit": "day⁻¹",            "chart_type": "bar"},
 }
