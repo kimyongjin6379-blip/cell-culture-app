@@ -85,6 +85,75 @@ def _digit_normalize(s: str) -> str:
     return re.sub(r"\b0+(\d)", r"\1", str(s).upper().strip())
 
 
+def _loose_normalize(s: str) -> str:
+    """Loose normalization: upper, collapse separators, strip leading zeros, unify '/'↔'+'."""
+    s = str(s).upper().replace("/", "+").strip()
+    s = re.sub(r"0+(\d)", r"\1", s)        # strip leading zeros
+    s = re.sub(r"[\s_\-]+", " ", s).strip()
+    return s
+
+
+def _build_canonical_map(raw_occ: dict, raw_days: dict, d0_treatments: set) -> dict:
+    """
+    Build raw → canonical treatment name map, merging:
+    - Zero-pad / '/'↔'+' variants via loose normalization
+    - Trailing feed-volume noise (e.g., 'IMDM 02' → 'IMDM')
+    - Missing-suffix typos (e.g., 'PEA' → 'PEA-1') when the shorter form is rare
+      and the longer form is frequent.
+    """
+    # 1) Group by loose_normalize
+    loose_groups = defaultdict(list)
+    for t in raw_occ:
+        loose_groups[_loose_normalize(t)].append(t)
+
+    canon = {}
+    for norm, members in loose_groups.items():
+        # Prefer a D0 member; else pick the most-frequent
+        d0_in = [m for m in members if m in d0_treatments]
+        if d0_in:
+            rep = max(d0_in, key=lambda x: raw_occ[x])
+        else:
+            rep = max(members, key=lambda x: raw_occ[x])
+        for m in members:
+            canon[m] = rep
+
+    # 2) Strip trailing " NN" (feed-volume noise) — if stripped form exists in canon
+    working = dict(canon)
+    for t, c in list(working.items()):
+        m = re.match(r"^(.+?)\s+\d{1,3}$", c)
+        if m:
+            stripped = m.group(1)
+            if stripped in canon and stripped != c:
+                canon[t] = canon[stripped]
+
+    # 3) Missing-suffix typos: short rare form is prefix of long frequent form
+    # Re-count occurrences after merge
+    group_occ = defaultdict(int)
+    group_days = defaultdict(set)
+    for raw, c in canon.items():
+        group_occ[c] += raw_occ[raw]
+        group_days[c].update(raw_days[raw])
+
+    reps = list(group_occ.keys())
+    # sort by occurrence descending
+    reps_sorted = sorted(reps, key=lambda x: -group_occ[x])
+    for short in reps:
+        if group_occ[short] > 6:   # common enough, skip
+            continue
+        # candidate longer reps that start with short + '-' or ' '
+        candidates = [r for r in reps if r != short
+                      and (r.startswith(short + "-") or r.startswith(short + " "))
+                      and group_occ[r] >= group_occ[short] * 3]
+        if candidates:
+            target = max(candidates, key=lambda x: group_occ[x])
+            # remap all raws that mapped to short → target
+            for raw, c in list(canon.items()):
+                if c == short:
+                    canon[raw] = target
+
+    return canon
+
+
 def _parse_vcd_sample(s: str):
     m = VCD_SAMPLE_RE.match(str(s))
     if not m:
@@ -185,15 +254,30 @@ def _read_raw_vcd(xl: pd.ExcelFile):
     if sample_col is None or vcd_col is None:
         raise ValueError(f"Could not locate Sample/VCD columns in {sheet}. Headers: {headers}")
 
-    # PASS 1: collect D0 treatments as canonical set
+    # PASS 1: collect treatment names with occurrence counts across all days
+    raw_occ = defaultdict(int)
+    raw_days = defaultdict(set)
     d0_treatments = set()
     for r in range(header_row + 1, len(df)):
         sample = df.iloc[r, sample_col]
         if pd.isna(sample):
             continue
         p = _parse_vcd_sample(sample)
-        if p and p["day"] == 0:
-            d0_treatments.add(p["treatment"])
+        if not p:
+            continue
+        # Strip trailing " NN" noise and try d0 merge at this stage is skipped
+        t = p["treatment"]
+        raw_occ[t] += 1
+        raw_days[t].add(p["day"])
+        if p["day"] == 0:
+            d0_treatments.add(t)
+
+    # Build canonical map by fuzzy merging:
+    # (a) zero-pad normalization: "SOY-BIO 01" ↔ "SOY-BIO 1"
+    # (b) punctuation typo: "CELL BOOST 7A/7B" ↔ "CELL BOOST 7A+7B"
+    # (c) missing-suffix typo: "PEA" (rare) ↔ "PEA-1" (frequent)
+    # (d) trailing feed-volume noise: "IMDM 02" ↔ "IMDM"
+    canon_map = _build_canonical_map(raw_occ, raw_days, d0_treatments)
 
     vcd: dict = defaultdict(lambda: defaultdict(dict))
     treatment_order: list = []
@@ -210,20 +294,8 @@ def _read_raw_vcd(xl: pd.ExcelFile):
         v = parsed["vessel"]
         d = parsed["day"]
 
-        # Build normalized lookup of D0 treatments (digit-padding-insensitive)
-        # This is done once per call via closure, but recomputing here is fine.
-        # Canonicalize trailing " NN" if stripping yields a D0 treatment.
-        m_noise = re.match(r"^(.+?)\s+\d{1,3}$", t)
-        if m_noise and m_noise.group(1) in d0_treatments and t not in d0_treatments:
-            t = m_noise.group(1)
-
-        # Map to a D0 treatment by digit-normalization (strip leading zeros in trailing nums)
-        t_norm = _digit_normalize(t)
-        if t not in d0_treatments:
-            for d0t in d0_treatments:
-                if _digit_normalize(d0t) == t_norm:
-                    t = d0t
-                    break
+        # Use canonical map built above
+        t = canon_map.get(t, t)
 
         # Clean vessel number suffix like "32-1"
         v = re.sub(r"-\d+$", "", v)
@@ -479,35 +551,29 @@ def process_file(file_bytes: bytes, basal_media: str = "", feed_media: str = "")
     for t, vessels in vcd.items():
         ivcd_all[t] = _compute_ivcd(vessels, all_days)
 
-    # μ intervals: based on feeding days + end day
-    duration = CULTURE_DURATIONS.get(cell_line, max(all_days) if all_days else 9)
+    # μ / Qp intervals: match researcher's 정리-sheet convention.
+    # For Fed-batch with feeding days: use only consecutive feeding-day intervals
+    # (exclude post-last-feed stretch, where cells enter stationary/death phase).
     feeding = FEEDING_DAYS.get(cell_line, {}).get(culture_mode, [])
 
-    # μ intervals = between consecutive measurement days (approximate via feeding + end)
-    if feeding:
-        mu_breakpoints = sorted(set(feeding + [duration]))
-    else:
-        mu_breakpoints = all_days[:]
-
-    mu_intervals = []
-    prev = 0
-    for bp in mu_breakpoints:
-        if bp > prev:
-            mu_intervals.append((prev, bp))
-            prev = bp
-
-    # Qp intervals: between titer sampling days
+    # Collect titer days
     titer_days = set()
     for t in titer.values():
         for rep in t.values():
             titer_days.update(rep.keys())
     titer_days = sorted(titer_days)
-    qp_intervals = []
-    prev = 0
-    for d in titer_days:
-        if d > prev:
-            qp_intervals.append((prev, d))
-            prev = d
+
+    if feeding and len(feeding) >= 2:
+        # Fed-batch: feeding-day-based intervals only
+        mu_intervals = [(feeding[i], feeding[i + 1]) for i in range(len(feeding) - 1)]
+        # Qp: same intervals, then filtered later if all-None (e.g. no D0 titer)
+        qp_intervals = mu_intervals[:]
+    else:
+        # Batch or VERO: consecutive measurement days
+        mu_intervals = [(all_days[i], all_days[i + 1]) for i in range(len(all_days) - 1)] \
+                        if len(all_days) >= 2 else []
+        qp_intervals = [(titer_days[i], titer_days[i + 1]) for i in range(len(titer_days) - 1)] \
+                        if len(titer_days) >= 2 else []
 
     # Compute μ & Qp
     mu_all = {t: _compute_mu(vessels, mu_intervals) for t, vessels in vcd.items()}
@@ -593,30 +659,53 @@ def _build_sections(treatment_order, vcd, ivcd_all, titer, mu_all, qp_all,
         sections["titer"] = {**SECTION_META["titer"], "days": titer_days,
                              "x_labels": [f"D{d}" for d in titer_days], "treatments": titer_treats}
 
-    # μ
-    mu_treats = {}
-    mu_labels = [f"D{s}-D{e}" for (s, e) in mu_intervals]
-    mu_days_only = [e for (_s, e) in mu_intervals]
+    # μ — filter intervals where ALL treatments have no data
+    mu_treats_full = {}
     for t in treatment_order:
         sorted_vessels = sorted(mu_all.get(t, {}).keys(), key=lambda x: (len(x), x))
         rows = [[mu_all[t][v].get((s, e)) for (s, e) in mu_intervals] for v in sorted_vessels]
         means, stds = _stats_from_rows(rows)
-        mu_treats[t] = {"mean": means, "std": stds, "replicates": rows}
+        mu_treats_full[t] = {"mean": means, "std": stds, "replicates": rows}
+    # Determine which intervals have at least one non-None value
+    keep_idx = [i for i in range(len(mu_intervals))
+                if any(mu_treats_full[t]["mean"][i] is not None for t in mu_treats_full
+                       if i < len(mu_treats_full[t]["mean"]))]
+    kept_mu_intervals = [mu_intervals[i] for i in keep_idx]
+    mu_labels = [f"D{s}-D{e}" for (s, e) in kept_mu_intervals]
+    mu_days_only = [e for (_s, e) in kept_mu_intervals]
+    mu_treats = {}
+    for t, stat in mu_treats_full.items():
+        mu_treats[t] = {
+            "mean": [stat["mean"][i] for i in keep_idx],
+            "std":  [stat["std"][i]  for i in keep_idx],
+            "replicates": [[rep[i] for i in keep_idx] for rep in stat["replicates"]],
+        }
     sections["mu"] = {**SECTION_META["mu"], "days": mu_days_only,
                       "x_labels": mu_labels, "treatments": mu_treats}
 
-    # Qp
+    # Qp — same filtering
     if qp_all and qp_intervals:
-        qp_treats = {}
-        qp_labels = [f"D{s}-D{e}" for (s, e) in qp_intervals]
-        qp_days_only = [e for (_s, e) in qp_intervals]
+        qp_treats_full = {}
         for t in treatment_order:
             if t not in qp_all:
                 continue
             rep_keys = sorted(qp_all[t].keys(), key=lambda x: (len(x), x))
             rows = [[qp_all[t][rk].get((s, e)) for (s, e) in qp_intervals] for rk in rep_keys]
             means, stds = _stats_from_rows(rows)
-            qp_treats[t] = {"mean": means, "std": stds, "replicates": rows}
+            qp_treats_full[t] = {"mean": means, "std": stds, "replicates": rows}
+        keep_idx = [i for i in range(len(qp_intervals))
+                    if any(qp_treats_full[t]["mean"][i] is not None for t in qp_treats_full
+                           if i < len(qp_treats_full[t]["mean"]))]
+        kept_qp = [qp_intervals[i] for i in keep_idx]
+        qp_labels = [f"D{s}-D{e}" for (s, e) in kept_qp]
+        qp_days_only = [e for (_s, e) in kept_qp]
+        qp_treats = {}
+        for t, stat in qp_treats_full.items():
+            qp_treats[t] = {
+                "mean": [stat["mean"][i] for i in keep_idx],
+                "std":  [stat["std"][i]  for i in keep_idx],
+                "replicates": [[rep[i] for i in keep_idx] for rep in stat["replicates"]],
+            }
         sections["qp"] = {**SECTION_META["qp"], "days": qp_days_only,
                           "x_labels": qp_labels, "treatments": qp_treats}
 
