@@ -88,6 +88,10 @@ def _digit_normalize(s: str) -> str:
 def _loose_normalize(s: str) -> str:
     """Loose normalization: upper, collapse separators, strip leading zeros, unify '/'↔'+'."""
     s = str(s).upper().replace("/", "+").strip()
+    # Strip parenthetical notes like "(PILOT)", "(pilot 2)" — they're noise
+    s = re.sub(r"\([^)]*\)", " ", s)
+    # Strip bare "PILOT" token too (appears unbracketed in some sheets)
+    s = re.sub(r"\bPILOT\b", " ", s)
     s = re.sub(r"0+(\d)", r"\1", s)        # strip leading zeros
     s = re.sub(r"[\s_\-]+", " ", s).strip()
     return s
@@ -145,7 +149,10 @@ def _build_canonical_map(raw_occ: dict, raw_days: dict, d0_treatments: set) -> d
                       and (r.startswith(short + "-") or r.startswith(short + " "))
                       and group_occ[r] >= group_occ[short] * 3]
         if candidates:
-            target = max(candidates, key=lambda x: group_occ[x])
+            # Prefer the simplest/shortest long form (e.g. "WHEAT-1" over
+            # "WHEAT-BIO 1") so rare short typos don't get absorbed into a
+            # longer, different treatment. Tie-break by higher occurrence.
+            target = min(candidates, key=lambda x: (len(x), -group_occ[x]))
             # remap all raws that mapped to short → target
             for raw, c in list(canon.items()):
                 if c == short:
@@ -169,10 +176,11 @@ def _parse_vcd_sample(s: str):
 
 def _parse_titer_sample(s: str, canonical_by_norm: dict):
     """
-    Parse titer sample identifiers.
-    canonical_by_norm: dict mapping normalized VCD treatment names → canonical VCD treatment
-    Returns (canonical_treatment, day, rep_key) or None.
-    rep_key is either vessel number (Hybridoma-style) or product variant (CHO _N style).
+    Parse titer sample identifiers. canonical_by_norm maps loose-normalized VCD
+    treatment → canonical name (may include _1/_2 sub-conditions).
+
+    Returns (canonical_treatment, day, rep_key or None) or None.
+    rep_key=None means positional rep; otherwise the explicit vessel/rep number.
     """
     m = TITER_SAMPLE_RE.match(str(s))
     if not m:
@@ -181,29 +189,39 @@ def _parse_titer_sample(s: str, canonical_by_norm: dict):
     day = int(day)
     tail = tail.strip()
 
-    # CHO-style: "SOY-BIO_1" → treatment="SOY-BIO", rep_key="1"
-    # Hybridoma-style: "IMDM 01" → treatment="IMDM", rep_key="01"
+    def find_canon(name):
+        return canonical_by_norm.get(_loose_normalize(name))
 
-    # Try CHO underscore variant first
-    und = re.match(r"^(.+?)_(\d+)\s*$", tail)
-    if und:
-        t_raw, rep_key = und.groups()
-        canon = canonical_by_norm.get(_normalize_name(t_raw))
-        if canon:
-            return canon, day, rep_key.strip()
+    # Priority 1: exact tail (e.g., "SOY-BIO_1" → VCD's "SOY-BIO 1")
+    c = find_canon(tail)
+    if c:
+        return c, day, None
 
-    # Try trailing vessel number (space-separated)
-    vs = re.match(r"^(.+?)\s+(\d{1,3})\s*$", tail)
-    if vs:
-        t_raw, rep_key = vs.groups()
-        canon = canonical_by_norm.get(_normalize_name(t_raw))
-        if canon:
-            return canon, day, rep_key.strip()
+    # Priority 2: tail is a split-base → default to "_1" sub-condition
+    c = find_canon(tail + "_1")
+    if c:
+        return c, day, None
 
-    # Fallback: whole tail as treatment
-    canon = canonical_by_norm.get(_normalize_name(tail))
-    if canon:
-        return canon, day, "1"
+    # Priority 3: tail has trailing number (could be sub-condition or vessel)
+    m2 = re.match(r"^(.+?)[_\s]#?(\d+)\s*$", tail)
+    if m2:
+        base, num = m2.group(1).strip(), m2.group(2).strip()
+        # Try "base_num" as sub-condition (e.g., "IMDM 2" → "IMDM_2")
+        c = find_canon(f"{base}_{num}")
+        if c:
+            return c, day, None
+        # Try "base num" as product variant (e.g., "SOY-BIO 1")
+        c = find_canon(f"{base} {num}")
+        if c:
+            return c, day, None
+        # Fall back: treat num as vessel/rep, match base
+        c = find_canon(base)
+        if c:
+            return c, day, num
+        c = find_canon(base + "_1")
+        if c:
+            return c, day, num
+
     return None
 
 
@@ -383,10 +401,8 @@ def _read_raw_titer(xl: pd.ExcelFile, canonical_by_norm: dict):
 
         treatment, day, rep_key = parsed
 
-        # If rep_key came from parse as literal "1" default (no trailing number in tail),
-        # assign positional rep_key per (treatment, day, test)
-        tail_has_num = bool(re.search(r"\d", str(sample).strip().split("D" + str(day), 1)[-1]))
-        if not tail_has_num:
+        # If parser returned None for rep_key → assign positional index per (treatment, day, test)
+        if rep_key is None:
             seq_counter[(treatment, day, test)] += 1
             rep_key = str(seq_counter[(treatment, day, test)])
 
@@ -400,6 +416,29 @@ def _read_raw_titer(xl: pd.ExcelFile, canonical_by_norm: dict):
 
 
 # ── Computations ─────────────────────────────────────────────────────────────
+
+def _split_multi_vessel(vcd: dict, treatment_order: list) -> tuple:
+    """
+    Split treatments with >2 vessels into sub-conditions (_1, _2, ...).
+    Each sub-condition gets 2 consecutive vessels (sorted).
+    Returns (new_vcd, new_treatment_order).
+    """
+    new_vcd: dict = {}
+    new_order: list = []
+    for t in treatment_order:
+        vd = vcd.get(t, {})
+        vessels = sorted(vd.keys(), key=lambda v: (len(v), v))
+        if len(vessels) <= 2:
+            new_vcd[t] = vd
+            new_order.append(t)
+        else:
+            for i in range(0, len(vessels), 2):
+                pair = vessels[i:i + 2]
+                sub = f"{t}_{i // 2 + 1}"
+                new_vcd[sub] = {v: vd[v] for v in pair}
+                new_order.append(sub)
+    return new_vcd, new_order
+
 
 def _build_vessel_to_rep(vcd: dict) -> dict:
     """For each treatment, sort vessels and assign rep indices."""
@@ -529,7 +568,12 @@ def process_file(file_bytes: bytes, basal_media: str = "", feed_media: str = "")
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
 
     vcd, all_days, treatment_order = _read_raw_vcd(xl)
-    canonical_by_norm = {_normalize_name(t): t for t in treatment_order}
+
+    # Split 4+ vessel treatments into _1, _2 sub-conditions (each with 2 reps)
+    vcd, treatment_order = _split_multi_vessel(vcd, treatment_order)
+
+    # Canonical lookup uses loose-normalize so it matches across sheet conventions
+    canonical_by_norm = {_loose_normalize(t): t for t in treatment_order}
 
     # Detect cell line / mode from samples
     samples = []
