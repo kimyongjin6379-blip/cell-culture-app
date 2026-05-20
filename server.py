@@ -1,14 +1,22 @@
+import logging
 import os
 import tempfile
 
+import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from processor import process_file
 
+logger = logging.getLogger("cell_culture_app")
+logging.basicConfig(level=logging.INFO)
+
 app = FastAPI(title="Cell Culture Analysis Tool")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+PEPTOMATCH_CELL_URL = os.environ.get("PEPTOMATCH_CELL_URL", "").rstrip("/")
+INGEST_TIMEOUT = float(os.environ.get("PEPTOMATCH_CELL_TIMEOUT", "30"))
 
 
 @app.get("/")
@@ -27,9 +35,35 @@ async def process(
     try:
         contents = await file.read()
         result = process_file(contents, basal_media=basal_media, feed_media=feed_media)
-        return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"처리 중 오류 발생: {str(e)}")
+
+    # Forward processed result to PeptoMatch Cell ingest endpoint (best-effort).
+    ingest_status = {"forwarded": False}
+    if PEPTOMATCH_CELL_URL:
+        payload = {
+            **result,
+            "source_filename": file.filename,
+            "basal_media": basal_media,
+            "feed_media": feed_media,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=INGEST_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{PEPTOMATCH_CELL_URL}/api/ingest", json=payload,
+                )
+            ingest_status = {
+                "forwarded": resp.status_code == 200,
+                "status_code": resp.status_code,
+                "response": resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text,
+            }
+            logger.info(f"Forwarded to peptomatchCell: {ingest_status}")
+        except Exception as e:
+            logger.warning(f"Ingest forward failed: {e}")
+            ingest_status = {"forwarded": False, "error": str(e)}
+
+    result["ingest"] = ingest_status
+    return JSONResponse(content=result)
 
 
 @app.get("/api/download/{file_id}")
